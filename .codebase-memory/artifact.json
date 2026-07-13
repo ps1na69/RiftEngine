@@ -1,0 +1,11 @@
+{
+    "schema_version": 2,
+    "commit": "936e573345c04638d7af5fb66ccb109e44b99354",
+    "indexed_at": "2026-07-13T07:18:33Z",
+    "project": "RiftEngine",
+    "nodes": 51,
+    "edges": 131,
+    "original_size": 1179648,
+    "compressed_size": 31916,
+    "compression_level": 9
+}
