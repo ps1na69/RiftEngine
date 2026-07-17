@@ -1,1 +1,10 @@
-raylib
+# Core Rendering
+PyOpenGL==3.1.7
+PyOpenGL_accelerate==3.1.7
+glfw==2.10.0
+
+# Computation
+numpy==2.2.3
+
+# Image loading
+Pillow==11.2.1
