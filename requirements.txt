@@ -1,6 +1,9 @@
 # Core Rendering
-PyOpenGL==3.1.7
-PyOpenGL_accelerate==3.1.7
+# Pinned to >=5.9 since that's the version range this migration's API
+# usage (Texture.get_handle, ComputeShader.run, Buffer format strings)
+# was actually verified against -- "latest" could drift to something
+# with different behavior later without anyone noticing.
+moderngl>=5.9
 glfw==2.10.0
 
 # Computation

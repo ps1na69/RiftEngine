@@ -1,14 +1,22 @@
 """
 rift/renderer/gpu_culling.py
 
-GPU-driven frustum culling via a compute shader. This is the standalone
-primitive: given an actor bounds buffer, it writes out the visible indices
-and a count, entirely on the GPU. Wiring those visible indices into
-SpriteBatch so culled sprites actually get skipped is Phase 3 work per
-RIFTENGINE_SPECIFICATION.md's own phase breakdown -- actor_manager.py
-doesn't exist yet, and that's what's meant to own the "which actors exist
-this frame" list this class culls against. Usable standalone in the
-meantime for a debug "N of M actors visible" readout.
+GPU-driven frustum culling via a compute shader. Standalone primitive, same
+scope note as before: wiring visible indices into SpriteBatch so culled
+sprites actually get skipped is what actor_manager.py (Phase 3) does;
+this class doesn't know about actors, just bounds-in/indices-out.
+
+Correctness note specific to this ModernGL migration: the compute shader
+writes to SSBOs that are then read back on the CPU via Buffer.read().
+ModernGL exposes no memory_barrier()/glMemoryBarrier equivalent anywhere
+in its public API (checked Context, Buffer, and ComputeShader -- none of
+them have it). ctx.finish() (a full pipeline stall, equivalent to
+glFinish) is used here as the correctness-preserving substitute before
+every readback. This is heavier than a targeted GL_SHADER_STORAGE_BARRIER
+would have been, but read_visible_indices() was already a synchronous
+CPU stall in the PyOpenGL version too (documented there as a Phase-4-will-
+fix-this-properly item) -- this doesn't make an already-synchronous path
+meaningfully worse, it just makes it correct under ModernGL's API surface.
 """
 
 from __future__ import annotations
@@ -16,10 +24,9 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 
+import moderngl
 import numpy as np
-from OpenGL import GL
 
-from . import gl_utils
 from .shader_compiler import ShaderCompiler
 
 logger = logging.getLogger("rift.renderer.culling")
@@ -47,21 +54,15 @@ class Frustum2D:
 
 
 class GPUCuller:
-    def __init__(self, shader_compiler: ShaderCompiler, compute_src: str, max_actors: int = 100_000):
+    def __init__(self, ctx: moderngl.Context, shader_compiler: ShaderCompiler, compute_src: str, max_actors: int = 100_000):
+        self.ctx = ctx
         self._program = shader_compiler.get_or_compile_compute("gpu_cull", compute_src)
         self._max_actors = max_actors
 
-        self._actor_ssbo = gl_utils.create_gl_object(GL.glCreateBuffers)
-        GL.glNamedBufferStorage(self._actor_ssbo, max_actors * _ACTOR_STRIDE, None, GL.GL_DYNAMIC_STORAGE_BIT)
-
-        self._visible_ssbo = gl_utils.create_gl_object(GL.glCreateBuffers)
-        GL.glNamedBufferStorage(self._visible_ssbo, max_actors * 4, None, GL.GL_DYNAMIC_STORAGE_BIT)
-
-        self._count_ssbo = gl_utils.create_gl_object(GL.glCreateBuffers)
-        GL.glNamedBufferStorage(self._count_ssbo, 4, None, GL.GL_DYNAMIC_STORAGE_BIT)
-
-        self._frustum_ubo = gl_utils.create_gl_object(GL.glCreateBuffers)
-        GL.glNamedBufferStorage(self._frustum_ubo, 4 * 16, None, GL.GL_DYNAMIC_STORAGE_BIT)
+        self._actor_ssbo = ctx.buffer(reserve=max_actors * _ACTOR_STRIDE, dynamic=True)
+        self._visible_ssbo = ctx.buffer(reserve=max_actors * 4, dynamic=True)
+        self._count_ssbo = ctx.buffer(reserve=4, dynamic=True)
+        self._frustum_ubo = ctx.buffer(reserve=4 * 16, dynamic=True)
 
         self._actor_count = 0
 
@@ -74,44 +75,41 @@ class GPUCuller:
         packed = np.zeros((n, 4), dtype=np.float32)
         packed[:, 0:2] = centers_xy
         packed[:, 3] = radii
-        GL.glNamedBufferSubData(self._actor_ssbo, 0, packed.nbytes, packed)
+        self._actor_ssbo.write(packed.tobytes())
         self._actor_count = n
 
     def cull(self, frustum: Frustum2D) -> None:
         if self._actor_count == 0:
             return
 
-        GL.glNamedBufferSubData(self._frustum_ubo, 0, frustum.planes.nbytes, frustum.planes)
+        self._frustum_ubo.write(frustum.planes.tobytes())
+        self._count_ssbo.write(np.zeros(1, dtype=np.uint32).tobytes())
 
-        zero = np.zeros(1, dtype=np.uint32)
-        GL.glNamedBufferSubData(self._count_ssbo, 0, 4, zero)
-
-        GL.glUseProgram(self._program)
-        GL.glBindBufferBase(GL.GL_SHADER_STORAGE_BUFFER, 0, self._actor_ssbo)
-        GL.glBindBufferBase(GL.GL_SHADER_STORAGE_BUFFER, 1, self._visible_ssbo)
-        GL.glBindBufferBase(GL.GL_SHADER_STORAGE_BUFFER, 2, self._count_ssbo)
-        GL.glBindBufferBase(GL.GL_UNIFORM_BUFFER, 1, self._frustum_ubo)
+        self._actor_ssbo.bind_to_storage_buffer(0)
+        self._visible_ssbo.bind_to_storage_buffer(1)
+        self._count_ssbo.bind_to_storage_buffer(2)
+        self._frustum_ubo.bind_to_uniform_block(1)
 
         group_count = (self._actor_count + _LOCAL_SIZE_X - 1) // _LOCAL_SIZE_X
-        GL.glDispatchCompute(group_count, 1, 1)
-        GL.glMemoryBarrier(GL.GL_SHADER_STORAGE_BARRIER_BIT)
+        self._program.run(group_count, 1, 1)
+        self.ctx.finish()  # see module docstring -- substitutes for the missing memory_barrier
 
     def read_visible_indices(self) -> np.ndarray:
-        """Synchronous readback -- fine for a debug counter, NOT fine to call
-        every frame in the real render path (that's a GPU->CPU stall, which
-        defeats the point of GPU-driven culling). The real consumer of
-        visible_ssbo is meant to be an indirect-draw-buffer-generating
-        compute pass, entirely GPU-side -- that's the Phase 4 Multi-Draw
-        Indirect work called out separately in the spec."""
-        count_bytes = GL.glGetNamedBufferSubData(self._count_ssbo, 0, 4)
+        """Already a synchronous readback even before the ctx.finish() this
+        migration added -- see module docstring. Fine for a debug counter,
+        NOT fine to call every frame in the real render path. The real
+        consumer of visible_ssbo is meant to be an indirect-draw-buffer,
+        entirely GPU-side -- Phase 4 MDI work, see sprite_batch.py's
+        flush_indirect() hook note."""
+        count_bytes = self._count_ssbo.read(4)
         count = int(np.frombuffer(count_bytes, dtype=np.uint32)[0])
         if count == 0:
             return np.empty(0, dtype=np.uint32)
-        data = GL.glGetNamedBufferSubData(self._visible_ssbo, 0, count * 4)
+        data = self._visible_ssbo.read(count * 4)
         return np.frombuffer(data, dtype=np.uint32).copy()
 
     def cleanup(self) -> None:
-        GL.glDeleteBuffers(1, [self._actor_ssbo])
-        GL.glDeleteBuffers(1, [self._visible_ssbo])
-        GL.glDeleteBuffers(1, [self._count_ssbo])
-        GL.glDeleteBuffers(1, [self._frustum_ubo])
+        self._actor_ssbo.release()
+        self._visible_ssbo.release()
+        self._count_ssbo.release()
+        self._frustum_ubo.release()

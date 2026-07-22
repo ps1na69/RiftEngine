@@ -1,11 +1,10 @@
 """
 rift/renderer/texture_manager.py
 
-Texture loading using DSA (glCreateTextures / glTextureStorage2D /
-glTextureSubImage2D), so nothing here ever needs a bound texture unit.
-Bindless residency is handled separately by
-bindless_textures.BindlessTextureManager -- this module owns *storage*,
-that one owns *residency*.
+Texture loading via ctx.texture() -- a single call replaces the old DSA
+two-step (glTextureStorage2D + glTextureSubImage2D). dtype='f1' (the
+default) means "unsigned byte, normalized 0..1 in-shader," which is
+exactly RGBA8 -- matches what Pillow's .convert("RGBA").tobytes() gives.
 """
 
 from __future__ import annotations
@@ -14,10 +13,9 @@ import logging
 from dataclasses import dataclass
 from pathlib import Path
 
-from OpenGL import GL
+import moderngl
 from PIL import Image
 
-from . import gl_utils
 from .bindless_textures import BindlessHandle, BindlessTextureManager
 
 logger = logging.getLogger("rift.renderer.textures")
@@ -25,7 +23,7 @@ logger = logging.getLogger("rift.renderer.textures")
 
 @dataclass
 class Texture:
-    id: int
+    texture: moderngl.Texture
     width: int
     height: int
     path: str | None
@@ -38,13 +36,14 @@ class TextureManager:
     concern once there's an actual asset pipeline driving *when* a texture
     is needed vs merely referenced."""
 
-    def __init__(self, bindless: BindlessTextureManager):
+    def __init__(self, ctx: moderngl.Context, bindless: BindlessTextureManager):
+        self.ctx = ctx
         self._bindless = bindless
         self._by_path: dict[str, Texture] = {}
         self._all: list[Texture] = []
         self.gpu_bytes_allocated = 0
 
-    def load(self, path: str | Path, *, srgb: bool = False) -> Texture:
+    def load(self, path: str | Path) -> Texture:
         path = str(path)
         if cached := self._by_path.get(path):
             return cached
@@ -53,19 +52,14 @@ class TextureManager:
         width, height = image.size
         data = image.tobytes()
 
-        texture_id = gl_utils.create_gl_object(GL.glCreateTextures, GL.GL_TEXTURE_2D)
-        internal_format = GL.GL_SRGB8_ALPHA8 if srgb else GL.GL_RGBA8
+        gl_texture = self.ctx.texture((width, height), 4, data=data)
+        gl_texture.filter = (moderngl.NEAREST, moderngl.NEAREST)
+        gl_texture.repeat_x = False
+        gl_texture.repeat_y = False
 
-        GL.glTextureStorage2D(texture_id, 1, internal_format, width, height)
-        GL.glTextureSubImage2D(texture_id, 0, 0, 0, width, height, GL.GL_RGBA, GL.GL_UNSIGNED_BYTE, data)
-        GL.glTextureParameteri(texture_id, GL.GL_TEXTURE_MIN_FILTER, GL.GL_NEAREST)
-        GL.glTextureParameteri(texture_id, GL.GL_TEXTURE_MAG_FILTER, GL.GL_NEAREST)
-        GL.glTextureParameteri(texture_id, GL.GL_TEXTURE_WRAP_S, GL.GL_CLAMP_TO_EDGE)
-        GL.glTextureParameteri(texture_id, GL.GL_TEXTURE_WRAP_T, GL.GL_CLAMP_TO_EDGE)
+        bindless_handle = self._bindless.acquire(gl_texture)
 
-        bindless_handle = self._bindless.acquire(texture_id)
-
-        texture = Texture(id=texture_id, width=width, height=height, path=path, bindless=bindless_handle)
+        texture = Texture(texture=gl_texture, width=width, height=height, path=path, bindless=bindless_handle)
         self._by_path[path] = texture
         self._all.append(texture)
         self.gpu_bytes_allocated += width * height * 4
@@ -78,22 +72,19 @@ class TextureManager:
         if cached := self._by_path.get(name):
             return cached
 
-        texture_id = gl_utils.create_gl_object(GL.glCreateTextures, GL.GL_TEXTURE_2D)
-        GL.glTextureStorage2D(texture_id, 1, GL.GL_RGBA8, width, height)
-        GL.glTextureSubImage2D(texture_id, 0, 0, 0, width, height, GL.GL_RGBA, GL.GL_UNSIGNED_BYTE, raw_rgba)
-        GL.glTextureParameteri(texture_id, GL.GL_TEXTURE_MIN_FILTER, GL.GL_NEAREST)
-        GL.glTextureParameteri(texture_id, GL.GL_TEXTURE_MAG_FILTER, GL.GL_NEAREST)
+        gl_texture = self.ctx.texture((width, height), 4, data=raw_rgba)
+        gl_texture.filter = (moderngl.NEAREST, moderngl.NEAREST)
 
-        bindless_handle = self._bindless.acquire(texture_id)
-        texture = Texture(id=texture_id, width=width, height=height, path=None, bindless=bindless_handle)
+        bindless_handle = self._bindless.acquire(gl_texture)
+        texture = Texture(texture=gl_texture, width=width, height=height, path=None, bindless=bindless_handle)
         self._by_path[name] = texture
         self._all.append(texture)
         self.gpu_bytes_allocated += width * height * 4
         return texture
 
     def unload(self, texture: Texture) -> None:
-        self._bindless.release(texture.id)
-        GL.glDeleteTextures(1, [texture.id])
+        self._bindless.release(texture.texture)
+        texture.texture.release()
         self._all.remove(texture)
         if texture.path:
             self._by_path.pop(texture.path, None)

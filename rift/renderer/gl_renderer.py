@@ -1,12 +1,14 @@
 """
 rift/renderer/gl_renderer.py
 
-GPU-resource + draw orchestration layer: shader compiler, texture manager,
-sprite batch, GPU culler, frame timing. Assumes an OpenGL 4.6 core context
-is already current -- that's rift.core.window.Window's job (window.create()
-must run before this is constructed). This class deliberately never touches
-GLFW directly: windowing and rendering are two different concerns now that
-raylib (which used to blur that line) is gone from the engine.
+Top-level renderer: creates the ModernGL context from the GLFW context
+Window already made current, and wires together ShaderCompiler /
+TextureManager / SpriteBatch / GPUCuller. begin_frame()/end_frame() drive
+Application's game loop, same shape as before.
+
+Window itself needed NO changes for this migration -- moderngl.create_context()
+just wraps whatever GL context GLFW already made current, exactly like the
+raw PyOpenGL calls did. The migration is entirely inside rift/renderer/.
 """
 
 from __future__ import annotations
@@ -15,8 +17,8 @@ import logging
 import time
 from pathlib import Path
 
+import moderngl
 import numpy as np
-from OpenGL import GL
 
 from . import gl_utils
 from .shader_compiler import ShaderCompiler
@@ -32,9 +34,9 @@ _SHADER_DIR = Path(__file__).parent / "shaders"
 
 def _build_ortho_matrix(width: float, height: float) -> np.ndarray:
     """Column-major mat4, flattened for a direct byte-copy into a std140
-    UBO (no glUniformMatrix transpose flag involved here -- this goes in
-    via glNamedBufferSubData, so the memory layout has to already be right).
-    World origin sits at the center of the screen."""
+    UBO via Buffer.write() -- same layout requirement as before, ModernGL's
+    write() is a raw memcpy just like glNamedBufferSubData was. World
+    origin sits at the center of the screen."""
     left, right = -width / 2.0, width / 2.0
     bottom, top = -height / 2.0, height / 2.0
     near, far = -1.0, 1.0
@@ -63,43 +65,39 @@ class GLRenderer:
         self.delta_time = 0.0
         self.fps = 0.0
 
-        self.capabilities = gl_utils.get_gl_capabilities()
-        gl_utils.enable_debug_output()
-        logger.info(
-            "GL %s | %s | %s", self.capabilities.version, self.capabilities.renderer, self.capabilities.vendor
-        )
-        if not self.capabilities.meets_minimum:
-            logger.warning("Context is below OpenGL 4.6 -- bindless textures will be unavailable.")
+        self.ctx = moderngl.create_context(require=460)
+        gl_utils.log_capabilities(self.ctx)
 
-        GL.glEnable(GL.GL_BLEND)
-        GL.glBlendFunc(GL.GL_SRC_ALPHA, GL.GL_ONE_MINUS_SRC_ALPHA)
-        GL.glClearColor(0.06, 0.06, 0.08, 1.0)
-        GL.glViewport(0, 0, self.width, self.height)
+        self.ctx.enable(moderngl.BLEND)
+        self.ctx.blend_func = (moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA)
+        self.ctx.viewport = (0, 0, self.width, self.height)
 
-        self.shader_compiler = ShaderCompiler(cache_dir=Path.home() / ".riftengine" / "shader_cache")
-        self.bindless = BindlessTextureManager(self.capabilities)
-        self.textures = TextureManager(self.bindless)
+        self.shader_compiler = ShaderCompiler(self.ctx)
 
-        self.sprite_batch = SpriteBatch(
-            self.shader_compiler,
+        bindless_supported = gl_utils.probe_bindless_support(self.ctx)
+        self.bindless = BindlessTextureManager(bindless_supported)
+        self.textures = TextureManager(self.ctx, self.bindless)
+
+        sprite_program = self.shader_compiler.get_or_compile(
+            "sprite_batch",
             (_SHADER_DIR / "sprite.vert").read_text(),
             (_SHADER_DIR / "sprite.frag").read_text(),
         )
-        self.culler = GPUCuller(self.shader_compiler, (_SHADER_DIR / "cull.comp").read_text())
+        self.sprite_batch = SpriteBatch(self.ctx, sprite_program)
+        self.culler = GPUCuller(self.ctx, self.shader_compiler, (_SHADER_DIR / "cull.comp").read_text())
 
-        self._camera_ubo = gl_utils.create_gl_object(GL.glCreateBuffers)
-        GL.glNamedBufferStorage(self._camera_ubo, 64, None, GL.GL_DYNAMIC_STORAGE_BIT)
-        GL.glBindBufferBase(GL.GL_UNIFORM_BUFFER, 0, self._camera_ubo)
+        self._camera_ubo = self.ctx.buffer(reserve=64, dynamic=True)
         self._update_camera()
 
     def _on_resize(self, width: int, height: int) -> None:
         self.width, self.height = width, height
-        GL.glViewport(0, 0, width, height)
+        self.ctx.viewport = (0, 0, width, height)
         self._update_camera()
 
     def _update_camera(self) -> None:
         matrix = _build_ortho_matrix(float(self.width), float(self.height))
-        GL.glNamedBufferSubData(self._camera_ubo, 0, matrix.nbytes, matrix)
+        self._camera_ubo.write(matrix.tobytes())
+        self._camera_ubo.bind_to_uniform_block(0)
 
     # -- frame loop --------------------------------------------------------
 
@@ -109,7 +107,7 @@ class GLRenderer:
         self._last_frame_time = now
         self.fps = 1.0 / self.delta_time if self.delta_time > 0 else 0.0
 
-        GL.glClear(GL.GL_COLOR_BUFFER_BIT | GL.GL_DEPTH_BUFFER_BIT)
+        self.ctx.clear(0.06, 0.06, 0.08, 1.0)
         self.sprite_batch.begin()
 
     def end_frame(self) -> None:
@@ -122,4 +120,4 @@ class GLRenderer:
         self.textures.unload_all()
         self.bindless.release_all()
         self.shader_compiler.cleanup()
-        GL.glDeleteBuffers(1, [self._camera_ubo])
+        self._camera_ubo.release()
